@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+import os
+import io
+import json
+import hashlib
+from datetime import datetime
+from typing import Optional, Tuple, List
+
+from dotenv import load_dotenv
+load_dotenv()
+
+import numpy as np
+import streamlit as st
+
+from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+# Prefer the native Ollama client for real streaming; fall back to LangChain if unavailable
+try:
+    import ollama
+    OLLAMA_NATIVE = True
+except Exception:
+    OLLAMA_NATIVE = False
+    try:
+        from langchain_ollama import ChatOllama, OllamaLLM
+    except Exception:
+        ChatOllama = None
+        OllamaLLM = None
+
+import chromadb
+from chromadb.utils import embedding_functions
+
+# -----------------------------
+# Simple login with two roles
+# -----------------------------
+CHATBOT_PASSWORD = os.getenv("CHATBOT_PASSWORD", "chatbot123")
+UPLOAD_PASSWORD = os.getenv("UPLOAD_PASSWORD", "upload123")
+
+if "authenticated" not in st.session_state:
+    st.session_state["authenticated"] = False
+if "can_upload" not in st.session_state:
+    st.session_state["can_upload"] = False
+
+if not st.session_state["authenticated"]:
+    with st.form("login", clear_on_submit=True):
+        pw = st.text_input("Password", type="password")
+        submit = st.form_submit_button("Login")
+        if submit:
+            if pw == CHATBOT_PASSWORD:
+                st.session_state["authenticated"] = True
+                st.session_state["can_upload"] = False
+                st.success("✅ Logged in (chat only)")
+            elif pw == UPLOAD_PASSWORD:
+                st.session_state["authenticated"] = True
+                st.session_state["can_upload"] = True
+                st.success("✅ Logged in (chat + upload)")
+            else:
+                st.error("❌ Wrong password")
+    st.stop()
+
+# -----------------------------
+# Settings (defaults are safe for CPU)
+# -----------------------------
+UPLOADS_DIR = "uploads"
+CHROMA_DIR = "chroma_store"
+
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "mistral")  # e.g., "mistral", "llama3.1:8b-instruct"
+EMBED_MODEL = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "800"))           # slightly smaller chunks improve precision
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "120"))
+TOP_K_DEFAULT = int(os.getenv("TOP_K", "4"))
+MAX_DISTANCE_DEFAULT = float(os.getenv("MAX_DISTANCE", "0.35"))  # lower = stricter match
+CONTEXT_CHAR_CAP_DEFAULT = int(os.getenv("CONTEXT_CHAR_CAP", "6000"))  # cap context passed to LLM
+NUM_PREDICT_DEFAULT = int(os.getenv("NUM_PREDICT", "512"))  # speed up long generations
+
+os.makedirs(UPLOADS_DIR, exist_ok=True)
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def file_sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+def load_docs_from_path(path: str):
+    lower = path.lower()
+    if lower.endswith(".pdf"):
+        loader = PyPDFLoader(path)
+    elif lower.endswith(".docx"):
+        loader = Docx2txtLoader(path)
+    elif lower.endswith(".txt") or lower.endswith(".md"):
+        loader = TextLoader(path, encoding="utf-8")
+    else:
+        raise ValueError("Unsupported file type.")
+    return loader.load()
+
+def split_docs(docs):
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
+    )
+    return splitter.split_documents(docs)
+
+# -----------------------------
+# Chroma Setup
+# -----------------------------
+embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
+    model_name=EMBED_MODEL
+)
+chroma_client = chromadb.PersistentClient(path=CHROMA_DIR)
+
+doc_collection = chroma_client.get_or_create_collection(
+    name="documents",
+    embedding_function=embedding_fn
+)
+
+cache_collection = chroma_client.get_or_create_collection(
+    name="chat_cache",
+    embedding_function=embedding_fn
+)
+
+# -----------------------------
+# Cache Functions
+# -----------------------------
+def exact_cache_get(query: str) -> Optional[str]:
+    try:
+        results = cache_collection.get(ids=[sha256_text(query)])
+        if results and results.get("documents"):
+            return results["documents"][0]
+    except Exception:
+        pass
+    return None
+
+def exact_cache_set(query: str, response: str):
+    try:
+        cache_collection.add(
+            documents=[response],
+            metadatas=[{"query": query, "ts": datetime.utcnow().isoformat()}],
+            ids=[sha256_text(query)]
+        )
+    except Exception:
+        pass
+
+def semantic_cache_get(query: str, top_k: int = 1, max_distance: float = 0.30) -> Optional[Tuple[str, float]]:
+    """
+    Return (response, distance) if the nearest cached item is within max_distance.
+    Lower distance == closer (Chroma distance).
+    """
+    try:
+        results = cache_collection.query(
+            query_texts=[query],
+            n_results=top_k,
+            include=["documents", "distances", "metadatas", "ids"]
+        )
+        if results and results.get("documents") and len(results["documents"][0]) > 0:
+            resp = results["documents"][0][0]
+            dist = float(results["distances"][0][0]) if results.get("distances") else 999.0
+            if dist <= max_distance:
+                return resp, dist
+    except Exception:
+        pass
+    return None
+
+def semantic_cache_set(query: str, response: str):
+    exact_cache_set(query, response)
+
+def clear_cache():
+    chroma_client.delete_collection("chat_cache")
+    # recreate
+    return chroma_client.get_or_create_collection(
+        name="chat_cache",
+        embedding_function=embedding_fn
+    )
+
+# -----------------------------
+# File Ingestion
+# -----------------------------
+def ingest_uploaded_file(uploaded_file):
+    data = uploaded_file.read()
+    digest = file_sha256(data)
+    ext = os.path.splitext(uploaded_file.name)[1].lower()
+    safe_name = f"{digest}{ext}"
+    disk_path = os.path.join(UPLOADS_DIR, safe_name)
+
+    if os.path.exists(disk_path):
+        return False, uploaded_file.name
+
+    with open(disk_path, "wb") as f:
+        f.write(data)
+
+    docs = load_docs_from_path(disk_path)
+    # Split + add chunk indices for better traceability
+    chunks = split_docs(docs)
+    for idx, c in enumerate(chunks):
+        c.metadata = c.metadata or {}
+        c.metadata.update({
+            "source_file": uploaded_file.name,
+            "sha256": digest,
+            "chunk_index": idx,
+            "chunk_size": len(c.page_content)
+        })
+
+    doc_collection.add(
+        documents=[c.page_content for c in chunks],
+        metadatas=[c.metadata for c in chunks],
+        ids=[sha256_text(f"{digest}-{c.metadata['chunk_index']}:{c.page_content[:80]}") for c in chunks]
+    )
+    return True, uploaded_file.name
+
+# -----------------------------
+# Real streaming to UI
+# -----------------------------
+def stream_ollama_answer(prompt: str, model_name: str, options=None):
+    """
+    Yields text chunks as they arrive.
+    Prefers native ollama client; falls back to LangChain streaming if available;
+    last resort is blocking invoke + fake chunks.
+    """
+    options = options or {}
+    # Native Ollama streaming
+    if OLLAMA_NATIVE:
+        try:
+            for part in ollama.generate(model=model_name, prompt=prompt, stream=True, options=options):
+                chunk = part.get("response", "")
+                if chunk:
+                    yield chunk
+            return
+        except Exception:
+            pass
+
+    # LangChain streaming fallback
+    if ChatOllama is not None:
+        try:
+            llm = ChatOllama(model=model_name, **options)
+            for chunk in llm.stream(prompt):
+                yield getattr(chunk, "content", str(chunk))
+            return
+        except Exception:
+            pass
+
+    # Last resort: blocking call (not recommended, but keeps app usable)
+    if OllamaLLM is not None:
+        llm = OllamaLLM(model=model_name, options=options)
+        text = llm.invoke(prompt)
+        for i in range(0, len(text), 64):
+            yield text[i:i+64]
+    else:
+        yield "Ollama streaming is unavailable. Please install the `ollama` Python package."
+
+def build_prompt(context: str, question: str) -> str:
+    return (
+        "You are a careful, concise assistant for answering ONLY from the provided context.\n"
+        "Rules:\n"
+        " - If the answer cannot be found in context, say \"I don't know based on the uploaded documents.\".\n"
+        " - Quote key lines when helpful and ALWAYS cite file names like [file.ext#chunk_idx].\n"
+        " - Keep answers short and factual.\n\n"
+        f"Context:\n{context}\n\n"
+        f"Question: {question}\n"
+        "Answer:"
+    )
+
+# -----------------------------
+# UI
+# -----------------------------
+st.set_page_config(page_title="📚 Team Knowledge Chatbot", layout="wide")
+st.title("📚 Team Knowledge Chatbot")
+
+with st.sidebar:
+    st.subheader("Settings")
+    model = st.selectbox(
+        "Ollama model",
+        options=["mistral", "llama3.1:8b-instruct", "phi3", "llama3"],
+        index=0
+    )
+    top_k = st.slider("Top-K chunks", min_value=1, max_value=8, value=TOP_K_DEFAULT, step=1)
+    max_distance = st.slider("Max distance (retrieval filter, lower = stricter)", 0.0, 1.0, value=MAX_DISTANCE_DEFAULT, step=0.01)
+    context_char_cap = st.number_input("Context character cap", min_value=1000, max_value=20000, value=CONTEXT_CHAR_CAP_DEFAULT, step=500)
+    num_predict = st.slider("Max tokens to generate (num_predict)", min_value=128, max_value=2048, value=NUM_PREDICT_DEFAULT, step=64)
+    show_sources = st.checkbox("Show retrieved resources", value=True)
+    bypass_cache = st.checkbox("Bypass cache (always query docs)", value=False)
+
+    if st.button("🧹 Clear cache"):
+#        global cache_collection
+        cache_collection = clear_cache()
+        st.success("Cache cleared.")
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# -----------------------------
+# File Upload
+# -----------------------------
+if st.session_state.get("can_upload", False):
+    uploaded_files = st.file_uploader(
+        "Upload PDF / DOCX / TXT / MD",
+        type=["pdf", "docx", "txt", "md"],
+        accept_multiple_files=True
+    )
+    if uploaded_files:
+        with st.spinner("Indexing…"):
+            for uf in uploaded_files:
+                try:
+                    ok, _ = ingest_uploaded_file(uf)
+                    if ok:
+                        st.success(f"Indexed {uf.name}")
+                    else:
+                        st.info(f"Skipped {uf.name} (already ingested)")
+                except Exception as e:
+                    st.error(f"Failed {uf.name}: {e}")
+else:
+    st.info("📂 File upload restricted. You only have chat access.")
+
+# -----------------------------
+# Chat history
+# -----------------------------
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+question = st.chat_input("Ask a question…")
+
+def build_context_from_results(results, max_chars: int):
+    """
+    Build context string with [file#chunk] tags, respecting max character cap.
+    Returns (context_text, shown_items) where shown_items are tuples for UI display.
+    """
+    context_parts = []
+    shown_items = []
+    used = 0
+
+    docs_list = results.get("documents", [[]])[0]
+    metas_list = results.get("metadatas", [[]])[0]
+    dists_list = results.get("distances", [[]])[0] if results.get("distances") else [None] * len(docs_list)
+
+    for doc, meta, dist in zip(docs_list, metas_list, dists_list):
+        src = meta.get("source_file", "unknown")
+        idx = meta.get("chunk_index", -1)
+        tag = f"[{src}#{idx}]"
+        snippet = doc.strip()
+        # Respect context cap
+        piece = f"{tag} {snippet}\n"
+        if used + len(piece) > max_chars:
+            break
+        context_parts.append(piece)
+        used += len(piece)
+        shown_items.append((src, idx, dist, snippet[:300] + ("…" if len(snippet) > 300 else "")))
+
+    return "\n".join(context_parts), shown_items
+
+if question:
+    st.session_state.messages.append({"role": "user", "content": question})
+    with st.chat_message("user"):
+        st.markdown(question)
+
+    answered = False
+
+    if not bypass_cache:
+        # 1) Exact cache
+        exact_hit = exact_cache_get(question)
+        if exact_hit:
+            with st.chat_message("assistant"):
+                st.markdown(exact_hit + "\n\n— _(exact cached)_")
+            st.session_state.messages.append({"role": "assistant", "content": exact_hit})
+            answered = True
+        else:
+            # 2) Semantic cache (stricter threshold)
+            sem_hit = semantic_cache_get(question, top_k=1, max_distance=min(max_distance, 0.28))
+            if sem_hit:
+                resp_text, dist = sem_hit
+                with st.chat_message("assistant"):
+                    st.markdown(resp_text + f"\n\n— _(semantic cached, dist={dist:.3f})_")
+                st.session_state.messages.append({"role": "assistant", "content": resp_text})
+                exact_cache_set(question, resp_text)
+                answered = True
+
+    if not answered:
+        # 3) Retrieve from documents (with include fields for sources)
+        results = doc_collection.query(
+            query_texts=[question],
+            n_results=top_k,
+            include=["documents", "metadatas", "distances"]
+        )
+
+        # Filter by max distance if distances are available
+        if results and results.get("documents"):
+            docs_list = results["documents"][0]
+            metas_list = results["metadatas"][0]
+            dists_list = results["distances"][0] if results.get("distances") else [None] * len(docs_list)
+
+            filtered_docs, filtered_metas, filtered_dists = [], [], []
+            for d, m, dist in zip(docs_list, metas_list, dists_list):
+                if (dist is None) or (dist <= max_distance):
+                    filtered_docs.append(d)
+                    filtered_metas.append(m)
+                    filtered_dists.append(dist)
+
+            if filtered_docs:
+                # overwrite with filtered results
+                results["documents"] = [filtered_docs]
+                results["metadatas"] = [filtered_metas]
+                results["distances"] = [filtered_dists]
+
+        if (not results) or (not results.get("documents")) or (len(results["documents"][0]) == 0):
+            with st.chat_message("assistant"):
+                st.warning("No relevant content found in your indexed documents (try lowering max distance or increasing Top-K).")
+        else:
+            context_text, shown_items = build_context_from_results(results, context_char_cap)
+            prompt = build_prompt(context_text, question)
+
+            with st.chat_message("assistant"):
+                stream_area = st.empty()
+                answer_accum = ""
+                options = {
+                    "num_ctx": 2048,            # allow enough room for context + answer
+                    "temperature": 0,
+                    "num_predict": num_predict
+                }
+                for chunk in stream_ollama_answer(prompt, model_name=model, options=options):
+                    answer_accum += chunk
+                    stream_area.markdown(answer_accum)
+
+                # Show retrieved resources with distances and chunk indices
+                if show_sources:
+                    with st.expander("🔎 Retrieved resources"):
+                        if "distances" in results and results["distances"] and len(results["distances"][0]) > 0:
+                            st.write("Lower distance = closer match")
+                        for src, idx, dist, snip in shown_items:
+                            st.markdown(f"**{src}** — chunk #{idx} — dist: `{dist:.3f}`" if dist is not None else f"**{src}** — chunk #{idx}")
+                            st.code(snip)
+
+            final_text = answer_accum if answer_accum else "I couldn't generate an answer."
+            st.session_state.messages.append({"role": "assistant", "content": final_text})
+
+            # Store in cache for future speed
+            exact_cache_set(question, final_text)
+            semantic_cache_set(question, final_text)
