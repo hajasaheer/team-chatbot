@@ -10,8 +10,8 @@ import uuid
 from utils.qa import qclient, EMBED_MODEL, DOC_COLLECTION, file_sha256, embed_texts_parallel
 
 
-CHUNK_SIZE = 500
-CHUNK_OVERLAP = 50
+CHUNK_SIZE = 800
+CHUNK_OVERLAP = 100
 
 
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:

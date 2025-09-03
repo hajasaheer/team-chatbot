@@ -1,6 +1,6 @@
 import streamlit as st
 from utils.ingestion import ingest_uploaded_file
-from utils.qa import ensure_collections, _collection_count, clear_cache, DOC_COLLECTION, CACHE_COLLECTION
+from utils.qa import ensure_collections, _collection_count, clear_cache, delete_cache_entry, DOC_COLLECTION, CACHE_COLLECTION
 
 from utils.qa import qclient, DOC_COLLECTION
 import streamlit as st
@@ -38,3 +38,14 @@ st.write(f"**{CACHE_COLLECTION}**: {_collection_count(CACHE_COLLECTION)} cache e
 if st.button("Clear Cache"):
     clear_cache()
     st.success("Cache cleared!")
+
+st.subheader("Delete Specific Cache Entry")
+query_to_delete = st.text_input("Enter the exact question to delete from cache:")
+if st.button("Delete Cache Entry"):
+    if query_to_delete.strip():
+        ok = delete_cache_entry(query_to_delete.strip())
+        if ok:
+            st.success(f"Cache entry for '{query_to_delete}' deleted.")
+        else:
+            st.error("Failed to delete cache entry.")
+
