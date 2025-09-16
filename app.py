@@ -7,7 +7,7 @@ st.write("Welcome! Use the sidebar to navigate:")
 
 st.markdown(
     """
-    - 👉 **Chat** — Ask questions to the AI
+    - 👉 **Chatbot** — Ask questions to the AI
     - 🔑 **Admin** — Manage documents & settings
     """
 )
