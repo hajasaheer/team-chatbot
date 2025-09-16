@@ -24,6 +24,12 @@ Built with **Streamlit**, **Qdrant**, **Sentence Transformers**, and **Ollama** 
 * Python **3.9+**
 * `pip` installed
 * **Ollama** running locally (`ollama run llama3` to verify)
+
+```bash
+ curl -fsSL https://ollama.com/install.sh | sh
+ ollama run llama3
+```
+
 * **Qdrant** running locally (via Docker):
 
 ```bash
