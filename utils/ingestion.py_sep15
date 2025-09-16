@@ -1,5 +1,3 @@
-# utils/ingestion.py
-
 import os
 import io
 import hashlib
@@ -9,10 +7,12 @@ from PyPDF2 import PdfReader
 from qdrant_client.http import models as qmodels
 import uuid
 
-from utils.qa import qclient, EMBED_MODEL, file_sha256, embed_texts_parallel, ensure_client_collection
+from utils.qa import qclient, EMBED_MODEL, DOC_COLLECTION, file_sha256, embed_texts_parallel
+
 
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 100
+
 
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
     """Split text into overlapping chunks."""
@@ -23,6 +23,7 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
         chunks.append(text[start:end])
         start += chunk_size - overlap
     return chunks
+
 
 def extract_text_from_pdf(file_bytes: bytes) -> str:
     """Extract text from PDF file bytes."""
@@ -38,57 +39,61 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
 def make_point_id(digest: str, idx: int) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{digest}_{idx}"))
 
-def ingest_uploaded_file(uploaded_file, client_id: str) -> Tuple[bool, Optional[str]]:
-    """Ingest file into a specific client's collection."""
-    collection_name = ensure_client_collection(client_id)
-
+def ingest_uploaded_file(uploaded_file) -> Tuple[bool, Optional[str]]:
+    """
+    Ingest a new uploaded file into Qdrant.
+    Returns (success, filename).
+    """
     file_bytes = uploaded_file.read()
     digest = file_sha256(file_bytes)
     fname = uploaded_file.name
 
-    # Check for duplicates
+    # 🔎 Check if this exact file is already in Qdrant
     try:
-        existing, _ = qclient.scroll(
-            collection_name=collection_name,
+        existing = qclient.scroll(
+            collection_name=DOC_COLLECTION,
             scroll_filter=qmodels.Filter(
                 must=[qmodels.FieldCondition(key="file_digest", match=qmodels.MatchValue(value=digest))]
             ),
-            limit=1,
+            limit=1
         )
-        if existing:
-            st.warning(f"File {fname} already ingested for {client_id}.")
+        if existing and existing[0]:
+            st.warning(f"File {fname} already ingested (sha256 match).")
             return False, fname
     except Exception:
         pass
 
-    # Extract text
+    # Parse document
     text = extract_text_from_pdf(file_bytes)
     if not text.strip():
-        st.error(f"No text extracted from {fname}")
+        st.error(f"No text could be extracted from {fname}")
         return False, fname
 
     # Chunk & embed
     chunks = chunk_text(text)
     embeddings = embed_texts_parallel(chunks)
 
-    points = [
-        qmodels.PointStruct(
-            id=make_point_id(digest, i),
-            vector=emb,
-            payload={
-                "text": chunk,
-                "source_file": fname,
-                "chunk_index": i,
-                "file_digest": digest,
-            },
+    # Upsert chunks into Qdrant
+    points = []
+    for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
+        points.append(
+            qmodels.PointStruct(
+                id=make_point_id(digest, i),   # ✅ valid UUID
+                vector=emb,
+                payload={
+                    "text": chunk,
+                    "source_file": fname,
+                    "chunk_index": i,
+                    "file_digest": digest,
+                },
+            )
         )
-        for i, (chunk, emb) in enumerate(zip(chunks, embeddings))
-    ]
+
 
     try:
-        qclient.upsert(collection_name=collection_name, points=points)
-        st.success(f"Ingested {len(points)} chunks from {fname} into {client_id}")
+        qclient.upsert(collection_name=DOC_COLLECTION, points=points)
+        st.success(f"Ingested {len(points)} chunks from {fname}")
         return True, fname
     except Exception as e:
-        st.error(f"Failed to upsert {fname} for {client_id}: {e}")
+        st.error(f"Failed to upsert {fname}: {e}")
         return False, fname

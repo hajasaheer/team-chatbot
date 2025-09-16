@@ -11,15 +11,15 @@ import uuid
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
-from dotenv import load_dotenv
 
+from dotenv import load_dotenv
 load_dotenv()
 
 # =========================
 # Config
 # =========================
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
-DOC_COLLECTION = os.getenv("DOC_COLLECTION", "documents_common")
+DOC_COLLECTION = os.getenv("DOC_COLLECTION", "documents")
 CACHE_COLLECTION = os.getenv("CACHE_COLLECTION", "chat_cache")
 
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
@@ -41,10 +41,13 @@ def sha256_text(text: str) -> str:
 def file_sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
-def make_uuid_from_hash(text: str) -> str:
-    """Deterministic UUID from hash (for cache IDs)."""
-    return str(uuid.UUID(hashlib.sha256(text.encode()).hexdigest()[0:32]))
+def make_cache_id(query: str) -> str:
+    """Consistent cache ID for queries"""
+    return sha256_text(query)
 
+def make_uuid_from_hash(text: str) -> str:
+    # Create a deterministic UUID from the SHA256 hash
+    return str(uuid.UUID(hashlib.sha256(text.encode()).hexdigest()[0:32]))
 # =========================
 # Ollama Streaming
 # =========================
@@ -88,21 +91,25 @@ def _create_collection(name: str):
         ),
     )
 
-def ensure_client_collection(client_id: str) -> str:
-    """Ensure a per-client document collection exists."""
-    collection_name = f"documents_{client_id}"
-    try:
-        qclient.get_collection(collection_name)
-    except Exception:
-        print(f"[Qdrant] Creating collection: {collection_name}")
-        _create_collection(collection_name)
-    return collection_name
+def ensure_collections():
+    for name in [DOC_COLLECTION, CACHE_COLLECTION]:
+        try:
+            qclient.get_collection(name)
+            print(f"[Collections] {name} exists ✅")
+        except Exception:
+            print(f"[Collections] Creating {name} ✅")
+            qclient.create_collection(
+                collection_name=name,
+                vectors_config=qmodels.VectorParams(
+                    size=EMBED_DIM, distance=qmodels.Distance.COSINE
+                ),
+            )
 
-def ensure_cache_collection():
-    """Ensure cache collection exists."""
+
+    # Cache collection
     size = _get_collection_vector_size(CACHE_COLLECTION)
     if size is None:
-        print(f"[Qdrant] Creating cache collection: {CACHE_COLLECTION}")
+        print(f"[Qdrant] Creating collection: {CACHE_COLLECTION}")
         _create_collection(CACHE_COLLECTION)
     elif size != EMBED_DIM:
         print(
@@ -110,38 +117,15 @@ def ensure_cache_collection():
             "Not recreating to avoid data loss."
         )
 
-def ensure_collections():
-    """Ensure both DOC_COLLECTION and CACHE_COLLECTION exist."""
-    for name in [DOC_COLLECTION, CACHE_COLLECTION]:
-        size = _get_collection_vector_size(name)
-        if size is None:
-            print(f"[Qdrant] Creating collection: {name}")
-            _create_collection(name)
-        elif size != EMBED_DIM:
-            print(
-                f"[Qdrant][WARN] {name} has vector size {size}, expected {EMBED_DIM}. "
-                "Not recreating to avoid data loss."
-            )
-
-def _collection_count(collection_name: str) -> int:
-    """Return the number of vectors in a collection."""
-    try:
-        info = qclient.get_collection(collection_name=collection_name)
-        return info.vectors_count
-    except Exception as e:
-        print(f"Error getting collection count for {collection_name}: {e}")
-        return 0
-
 # =========================
 # Search
 # =========================
-def qdrant_search(query: str, client_id: str, top_k: int = 5, score_threshold: float = 0.2):
-    """Search inside a specific client's collection."""
+def qdrant_search(query: str, top_k: int = 5, score_threshold: float = 0.2):
+    """Search document collection in Qdrant."""
     vec = EMBED_MODEL.encode(query, convert_to_numpy=True).tolist()
-    collection_name = ensure_client_collection(client_id)
     try:
         res = qclient.search(
-            collection_name=collection_name,
+            collection_name=DOC_COLLECTION,
             query_vector=vec,
             limit=top_k,
             score_threshold=score_threshold,
@@ -149,14 +133,18 @@ def qdrant_search(query: str, client_id: str, top_k: int = 5, score_threshold: f
         )
         return res
     except Exception as e:
-        print(f"[Qdrant] Search failed for {collection_name}: {e}")
+        print(f"[Qdrant] Search failed: {e}")
         return []
+
+        print(f"[Cache] Semantic cache set failed: {e}")
+
 
 # =========================
 # Cache Handling
 # =========================
+
 def exact_cache_get(query: str) -> Optional[str]:
-    key = make_uuid_from_hash(query)
+    key = make_uuid_from_hash(query)   # ✅ use UUID consistently
     try:
         point = qclient.retrieve(collection_name=CACHE_COLLECTION, ids=[str(key)])
         if point and point[0].payload:
@@ -168,25 +156,37 @@ def exact_cache_get(query: str) -> Optional[str]:
         print(f"[Cache] Exact retrieval failed: {e}")
     return None
 
+
+def _cache_upsert_common(key: str, query: str, response: str, vector: List[float]):
+    payload = {
+        "query": query,
+        "response": response,
+        "ts": datetime.utcnow().isoformat(),
+    }
+    pt = qmodels.PointStruct(id=str(key), vector=vector, payload=payload)
+    qclient.upsert(collection_name=CACHE_COLLECTION, points=[pt])
+    print(f"[Cache] Upsert id={str(key)[:8]} query='{query[:40]}...'")
+
+
+
 def exact_cache_set(query: str, response: str):
-    key = make_uuid_from_hash(query)
+    key = make_uuid_from_hash(query)   # ✅ UUID instead of raw sha256 hex
     vec = EMBED_MODEL.encode(query, convert_to_numpy=True).tolist()
-    pt = qmodels.PointStruct(
-        id=key,
-        vector=vec,
-        payload={
-            "query": query,
-            "response": response,
-            "ts": datetime.utcnow().isoformat(),
-        },
-    )
+    payload = {
+        "query": query,
+        "response": response,
+        "ts": datetime.utcnow().isoformat(),
+    }
+    print(f"[Cache] Upserting (exact) into {CACHE_COLLECTION} → id={key} query='{query[:30]}...'")
+    pt = qmodels.PointStruct(id=key, vector=vec, payload=payload)
     try:
         qclient.upsert(collection_name=CACHE_COLLECTION, points=[pt])
-        print(f"[Cache] Upserted (exact) id={key[:8]}")
     except Exception as e:
         print(f"[Cache] Upsert failed: {e}")
 
-def semantic_cache_get(query: str, top_k: int = 1, min_score: float = SEMANTIC_CACHE_MIN_SCORE) -> Optional[Tuple[str, float]]:
+def semantic_cache_get(
+    query: str, top_k: int = 1, min_score: float = SEMANTIC_CACHE_MIN_SCORE
+) -> Optional[Tuple[str, float]]:
     qvec = EMBED_MODEL.encode(query, convert_to_numpy=True).tolist()
     try:
         res = qclient.search(
@@ -206,9 +206,13 @@ def semantic_cache_get(query: str, top_k: int = 1, min_score: float = SEMANTIC_C
         print(f"[Cache] Semantic lookup failed: {e}")
     return None
 
+
+
+
 def semantic_cache_set(query: str, answer: str):
     vec = embed_texts_parallel([query])[0]
-    uid = make_uuid_from_hash(query + answer)
+    uid = make_uuid_from_hash(query + answer)   # ✅ UUID instead of raw sha256 hex
+    print(f"[Cache] Upserting (semantic) into {CACHE_COLLECTION} → id={uid[:8]} query='{query[:30]}...'")
     pt = qmodels.PointStruct(
         id=uid,
         vector=vec,
@@ -220,7 +224,6 @@ def semantic_cache_set(query: str, answer: str):
     )
     try:
         qclient.upsert(collection_name=CACHE_COLLECTION, points=[pt])
-        print(f"[Cache] Upserted (semantic) id={uid[:8]}")
     except Exception as e:
         print(f"[Cache] Semantic cache set failed: {e}")
 
@@ -240,7 +243,19 @@ def delete_cache_entry(query: str) -> bool:
 # =========================
 # Admin Helpers
 # =========================
+def _collection_count(name: str) -> int:
+    try:
+        res = qclient.count(collection_name=name, exact=True)
+        return int(res.count)
+    except Exception as e:
+        print(f"[Qdrant] Count check failed for {name}: {e}")
+        return 0
+
 def clear_cache() -> bool:
+    """
+    Clear ALL cache entries.
+    Safe to recreate here because it's an explicit admin action.
+    """
     try:
         qclient.recreate_collection(
             collection_name=CACHE_COLLECTION,
@@ -264,6 +279,7 @@ def embed_texts_parallel(texts: List[str]) -> List[List[float]]:
 # Prompt Builder
 # =========================
 def build_prompt(query: str, context: str) -> str:
+    """Builds the prompt (query first, then context)."""
     return f"""You are a helpful assistant. Use the provided context to answer the question.
 
 Question:
@@ -274,7 +290,5 @@ Context:
 
 Answer:"""
 
-# =========================
-# Init on Import
-# =========================
-ensure_cache_collection()
+# Ensure collections exist
+ensure_collections()
