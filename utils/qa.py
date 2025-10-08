@@ -48,11 +48,7 @@ def make_uuid_from_hash(text: str) -> str:
 # =========================
 # Ollama Streaming
 # =========================
-def stream_ollama_answer(
-    prompt: str,
-    model: str = DEFAULT_MODEL,
-    stream: bool = True,
-):
+def stream_ollama_answer(prompt: str, model: str = DEFAULT_MODEL, stream: bool = True):
     """Stream answer tokens from Ollama API."""
     url = f"{OLLAMA_URL}/api/generate"
     payload = {"model": model, "prompt": prompt, "stream": stream}
@@ -76,20 +72,17 @@ def stream_ollama_answer(
 def _get_collection_vector_size(name: str) -> Optional[int]:
     try:
         info = qclient.get_collection(collection_name=name)
-        return int(info.config.params.vectors.size)  # type: ignore
+        return int(info.config.params.vectors.size)
     except Exception:
         return None
 
 def _create_collection(name: str):
     qclient.create_collection(
         collection_name=name,
-        vectors_config=qmodels.VectorParams(
-            size=EMBED_DIM, distance=qmodels.Distance.COSINE
-        ),
+        vectors_config=qmodels.VectorParams(size=EMBED_DIM, distance=qmodels.Distance.COSINE),
     )
 
 def ensure_client_collection(client_id: str) -> str:
-    """Ensure a per-client document collection exists."""
     collection_name = f"documents_{client_id}"
     try:
         qclient.get_collection(collection_name)
@@ -99,38 +92,12 @@ def ensure_client_collection(client_id: str) -> str:
     return collection_name
 
 def ensure_cache_collection():
-    """Ensure cache collection exists."""
     size = _get_collection_vector_size(CACHE_COLLECTION)
     if size is None:
         print(f"[Qdrant] Creating cache collection: {CACHE_COLLECTION}")
         _create_collection(CACHE_COLLECTION)
     elif size != EMBED_DIM:
-        print(
-            f"[Qdrant][WARN] {CACHE_COLLECTION} has vector size {size}, expected {EMBED_DIM}. "
-            "Not recreating to avoid data loss."
-        )
-
-def ensure_collections():
-    """Ensure both DOC_COLLECTION and CACHE_COLLECTION exist."""
-    for name in [DOC_COLLECTION, CACHE_COLLECTION]:
-        size = _get_collection_vector_size(name)
-        if size is None:
-            print(f"[Qdrant] Creating collection: {name}")
-            _create_collection(name)
-        elif size != EMBED_DIM:
-            print(
-                f"[Qdrant][WARN] {name} has vector size {size}, expected {EMBED_DIM}. "
-                "Not recreating to avoid data loss."
-            )
-
-def _collection_count(collection_name: str) -> int:
-    """Return the number of vectors in a collection."""
-    try:
-        info = qclient.get_collection(collection_name=collection_name)
-        return info.vectors_count
-    except Exception as e:
-        print(f"Error getting collection count for {collection_name}: {e}")
-        return 0
+        print(f"[Qdrant][WARN] Cache vector size mismatch ({size} vs {EMBED_DIM})")
 
 # =========================
 # Search
@@ -155,21 +122,21 @@ def qdrant_search(query: str, client_id: str, top_k: int = 5, score_threshold: f
 # =========================
 # Cache Handling
 # =========================
-def exact_cache_get(query: str) -> Optional[str]:
-    key = make_uuid_from_hash(query)
+def exact_cache_get(query: str, client_id: str) -> Optional[str]:
+    key = make_uuid_from_hash(client_id + ":" + query)
     try:
         point = qclient.retrieve(collection_name=CACHE_COLLECTION, ids=[str(key)])
-        if point and point[0].payload:
+        if point and point[0].payload and point[0].payload.get("client_id") == client_id:
             resp = point[0].payload.get("response")
             if resp:
-                print(f"[Cache] Exact hit id={str(key)[:8]}")
+                print(f"[Cache] Exact hit for client={client_id} id={str(key)[:8]}")
                 return resp
     except Exception as e:
         print(f"[Cache] Exact retrieval failed: {e}")
     return None
 
-def exact_cache_set(query: str, response: str):
-    key = make_uuid_from_hash(query)
+def exact_cache_set(query: str, response: str, client_id: str):
+    key = make_uuid_from_hash(client_id + ":" + query)
     vec = EMBED_MODEL.encode(query, convert_to_numpy=True).tolist()
     pt = qmodels.PointStruct(
         id=key,
@@ -177,16 +144,18 @@ def exact_cache_set(query: str, response: str):
         payload={
             "query": query,
             "response": response,
+            "client_id": client_id,
             "ts": datetime.utcnow().isoformat(),
         },
     )
     try:
         qclient.upsert(collection_name=CACHE_COLLECTION, points=[pt])
-        print(f"[Cache] Upserted (exact) id={key[:8]}")
+        print(f"[Cache] Upserted exact id={key[:8]} client={client_id}")
     except Exception as e:
         print(f"[Cache] Upsert failed: {e}")
 
-def semantic_cache_get(query: str, top_k: int = 1, min_score: float = SEMANTIC_CACHE_MIN_SCORE) -> Optional[Tuple[str, float]]:
+def semantic_cache_get(query: str, client_id: str, top_k: int = 1,
+                       min_score: float = SEMANTIC_CACHE_MIN_SCORE) -> Optional[Tuple[str, float]]:
     qvec = EMBED_MODEL.encode(query, convert_to_numpy=True).tolist()
     try:
         res = qclient.search(
@@ -194,87 +163,74 @@ def semantic_cache_get(query: str, top_k: int = 1, min_score: float = SEMANTIC_C
             query_vector=qvec,
             limit=top_k,
             with_payload=True,
+            query_filter=qmodels.Filter(
+                must=[qmodels.FieldCondition(key="client_id", match=qmodels.MatchValue(value=client_id))]
+            ),
         )
         if res:
             item = res[0]
             response_text = item.payload.get("response") if item.payload else None
             score = float(getattr(item, "score", 0.0))
             if response_text and score >= min_score:
-                print(f"[Cache] Semantic hit score={score:.3f}")
+                print(f"[Cache] Semantic hit client={client_id} score={score:.3f}")
                 return response_text, score
     except Exception as e:
         print(f"[Cache] Semantic lookup failed: {e}")
     return None
 
-def semantic_cache_set(query: str, answer: str):
-    vec = embed_texts_parallel([query])[0]
-    uid = make_uuid_from_hash(query + answer)
+def semantic_cache_set(query: str, answer: str, client_id: str):
+    vec = EMBED_MODEL.encode(query, convert_to_numpy=True).tolist()
+    uid = make_uuid_from_hash(client_id + ":" + query + ":" + answer)
     pt = qmodels.PointStruct(
         id=uid,
         vector=vec,
         payload={
             "query": query,
             "response": answer,
+            "client_id": client_id,
             "ts": datetime.utcnow().isoformat(),
         },
     )
     try:
         qclient.upsert(collection_name=CACHE_COLLECTION, points=[pt])
-        print(f"[Cache] Upserted (semantic) id={uid[:8]}")
+        print(f"[Cache] Semantic upsert client={client_id} id={uid[:8]}")
     except Exception as e:
         print(f"[Cache] Semantic cache set failed: {e}")
 
-def delete_cache_entry(query: str) -> bool:
-    key = make_uuid_from_hash(query)
-    try:
-        qclient.delete(
-            collection_name=CACHE_COLLECTION,
-            points_selector=qmodels.PointIdsList(points=[key]),
-        )
-        print(f"[Cache] Deleted id={key[:8]}")
-        return True
-    except Exception as e:
-        print(f"[Cache] Delete failed: {e}")
-        return False
-
-# =========================
-# Admin Helpers
-# =========================
-def clear_cache() -> bool:
-    try:
-        qclient.recreate_collection(
-            collection_name=CACHE_COLLECTION,
-            vectors_config=qmodels.VectorParams(
-                size=EMBED_DIM, distance=qmodels.Distance.COSINE
-            ),
-        )
-        print("[Cache] Cleared (recreated collection).")
-        return True
-    except Exception as e:
-        print(f"[Cache] Clear cache failed: {e}")
-        return False
 
 # =========================
 # Embedding helper
 # =========================
 def embed_texts_parallel(texts: List[str]) -> List[List[float]]:
+    """Encode a list of texts into embeddings (parallelized if supported by the model)."""
     return EMBED_MODEL.encode(texts, convert_to_numpy=True).tolist()
 
 # =========================
 # Prompt Builder
 # =========================
 def build_prompt(query: str, context: str) -> str:
-    return f"""You are a helpful assistant. Use the provided context to answer the question.
+    return f"""
+You are an assistant that answers questions **strictly using only the provided context**.
+If the context does not contain the answer, respond exactly with:
+"I don't know based on the provided context."
 
+Do not generate or assume any information that is not present in the context.
+Do not start your answer with phrases like "According to the provided context" or similar.
+
+---
 Question:
 {query}
 
+---
 Context:
-{context}
+{context or "No relevant context provided."}
 
-Answer:"""
+---
+Answer:
+"""
 
 # =========================
 # Init on Import
 # =========================
 ensure_cache_collection()
+
