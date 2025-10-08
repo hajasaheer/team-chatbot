@@ -17,7 +17,7 @@ st.title("📂 Admin – Document Management")
 ensure_cache_collection()
 
 # Select client
-client_id = st.selectbox("Select Client", ["Common", "Bosswallah", "SBSOL", "Thinksynq", "Pumex"])
+client_id = st.selectbox("Select Client", ["Common", "client1", "client2", "client3", "client4"])
 collection_name = f"documents_{client_id}"
 ensure_client_collection(client_id)
 

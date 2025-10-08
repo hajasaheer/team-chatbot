@@ -5,7 +5,7 @@ from utils.qa import (
 )
 
 
-client_id = st.selectbox("Select Client", ["Common", "Bosswallah", "SBSOL", "Thinksynq", "Pumex"])
+client_id = st.selectbox("Select Client", ["Common", "client1", "client2", "client3", "client4"])
 
 st.title("💬 Chatbot")
 
